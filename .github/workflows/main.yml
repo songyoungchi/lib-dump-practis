@@ -1,15 +1,11 @@
-name: Dump libgame.so functions with Ghidra
+name: Dump libgame.so Functions
 
 on:
+  workflow_dispatch:
   push:
-    paths:
-      - 'libgame.so'          # Trigger only when libgame.so changes
-  workflow_dispatch:          # Allow manual runs
-
 jobs:
-  analyze:
+  ghidra-analysis:
     runs-on: ubuntu-latest
-
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
@@ -17,54 +13,61 @@ jobs:
       - name: Set up JDK 17
         uses: actions/setup-java@v4
         with:
-          java-version: '17'
           distribution: 'temurin'
+          java-version: '17'
 
-      - name: Download and extract Ghidra
+      - name: Download Ghidra
         run: |
-          wget -q https://github.com/NationalSecurityAgency/ghidra/releases/download/Ghidra_11.0.2_build/ghidra_11.0.2_PUBLIC_20240109.zip
-          unzip -q ghidra_11.0.2_PUBLIC_20240109.zip -d ghidra
-          echo "GHIDRA_HOME=$PWD/ghidra/ghidra_11.0.2_PUBLIC" >> $GITHUB_ENV
+          wget -q https://github.com/NationalSecurityAgency/ghidra/releases/download/Ghidra_11.0.1_build/ghidra_11.0.1_PUBLIC_20240130.zip
+          unzip -q ghidra_11.0.1_PUBLIC_20240130.zip
+          echo "GHIDRA_INSTALL_DIR=$PWD/ghidra_11.0.1_PUBLIC" >> $GITHUB_ENV
 
-      - name: Create Ghidra script to dump functions
+      - name: Create output directories and Ghidra script
         run: |
-          cat > dump_functions.py << 'EOF'
-          # Ghidra script: exports all functions (address, name, size, signature)
-          from ghidra.program.model.listing import Function
+          mkdir -p output
+          mkdir -p ghidra_scripts
+          cat > ghidra_scripts/ListFunctions.py << 'EOF'
+          # Ghidra script to export function list
+          # @category: Analysis
+          # @menupath: Tools.Export Function List
+          # @description: Exports list of functions with addresses, names, sizes, and signatures to CSV.
+
+          import csv
           import os
+          from ghidra.program.model.listing import Function
+          from ghidra.program.model.symbol import SourceType
+          from ghidra.util.task import ConsoleTaskMonitor
 
-          output_path = os.path.join(os.environ["GITHUB_WORKSPACE"], "functions_output.txt")
-          fm = currentProgram.getFunctionManager()
-          functions = fm.getFunctions(True)   # forward iteration
+          program = getCurrentProgram()
+          function_manager = program.getFunctionManager()
+          functions = function_manager.getFunctions(True)  # true = forward
 
-          with open(output_path, "w") as f:
-              f.write("Address\tName\tSize\tSignature\n")
+          output_dir = os.environ.get('GITHUB_WORKSPACE', '.') + '/output'
+          os.makedirs(output_dir, exist_ok=True)
+          csv_file = os.path.join(output_dir, 'functions.csv')
+
+          count = 0
+          with open(csv_file, 'w', newline='') as f:
+              writer = csv.writer(f)
+              writer.writerow(['Address', 'Name', 'Size', 'Signature'])
               for func in functions:
-                  try:
-                      sig = func.getSignature().getPrototypeString()
-                  except:
-                      sig = "N/A"
                   addr = func.getEntryPoint()
                   name = func.getName()
                   size = func.getBody().getNumAddresses()
-                  f.write(f"{addr}\t{name}\t{size}\t{sig}\n")
+                  sig = func.getSignature().getPrototypeString()
+                  writer.writerow([addr, name, size, sig])
+                  count += 1
 
-          print("Dumped {} functions to {}".format(fm.getFunctionCount(), output_path))
+          print('Exported {} functions to {}'.format(count, csv_file))
           EOF
-          echo "SCRIPT_PATH=$PWD/dump_functions.py" >> $GITHUB_ENV
 
       - name: Run Ghidra headless analysis
         run: |
-          mkdir -p ghidra_projects
-          $GHIDRA_HOME/support/analyzeHeadless ghidra_projects project1 \
-            -import libgame.so \
-            -overwrite \
-            -scriptPath $GITHUB_WORKSPACE \
-            -postScript dump_functions.py \
-            -deleteProject
+          mkdir -p ghidra_project
+          $GHIDRA_INSTALL_DIR/support/analyzeHeadless ghidra_project project1 -import libgame.so -scriptPath ghidra_scripts -postScript ListFunctions.py -deleteProject
 
-      - name: Upload functions output
+      - name: Upload function list artifact
         uses: actions/upload-artifact@v4
         with:
           name: libgame-functions
-          path: functions_output.txt
+          path: output/functions.csv
