@@ -3,6 +3,8 @@ name: Dump libgame.so Functions
 on:
   workflow_dispatch:
   push:
+    paths:
+
 jobs:
   ghidra-analysis:
     runs-on: ubuntu-latest
@@ -11,7 +13,7 @@ jobs:
         uses: actions/checkout@v4
 
       - name: Set up JDK 17
-        uses: actions/setup-java@v4
+        uses: actions/setup-java@v5
         with:
           distribution: 'temurin'
           java-version: '17'
@@ -27,27 +29,30 @@ jobs:
           mkdir -p output
           mkdir -p ghidra_scripts
           cat > ghidra_scripts/ListFunctions.py << 'EOF'
-          # Ghidra script to export function list
+          # Ghidra script to export function list (Python 2 / Jython compatible)
           # @category: Analysis
           # @menupath: Tools.Export Function List
           # @description: Exports list of functions with addresses, names, sizes, and signatures to CSV.
 
           import csv
           import os
-          from ghidra.program.model.listing import Function
-          from ghidra.program.model.symbol import SourceType
-          from ghidra.util.task import ConsoleTaskMonitor
+          import errno
 
           program = getCurrentProgram()
           function_manager = program.getFunctionManager()
           functions = function_manager.getFunctions(True)  # true = forward
 
           output_dir = os.environ.get('GITHUB_WORKSPACE', '.') + '/output'
-          os.makedirs(output_dir, exist_ok=True)
+          try:
+              os.makedirs(output_dir)
+          except OSError as e:
+              if e.errno != errno.EEXIST:
+                  raise
+
           csv_file = os.path.join(output_dir, 'functions.csv')
 
           count = 0
-          with open(csv_file, 'w', newline='') as f:
+          with open(csv_file, 'w') as f:
               writer = csv.writer(f)
               writer.writerow(['Address', 'Name', 'Size', 'Signature'])
               for func in functions:
