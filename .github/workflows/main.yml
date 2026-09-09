@@ -1,12 +1,14 @@
-name: Dump libgame.so Functions
+name: Full Dump of libgame.so
 
 on:
   workflow_dispatch:
   push:
     paths:
+      - 'libgame.so'
+      - '.github/workflows/full_dump.yml'
 
 jobs:
-  ghidra-analysis:
+  ghidra-full-dump:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout repository
@@ -24,23 +26,19 @@ jobs:
           unzip -q ghidra_11.0.1_PUBLIC_20240130.zip
           echo "GHIDRA_INSTALL_DIR=$PWD/ghidra_11.0.1_PUBLIC" >> $GITHUB_ENV
 
-      - name: Create output directories and Ghidra script
+      - name: Create output directories and Ghidra scripts
         run: |
           mkdir -p output
           mkdir -p ghidra_scripts
-          cat > ghidra_scripts/ListFunctions.py << 'EOF'
-          # Ghidra script to export function list (Python 2 / Jython compatible)
-          # @category: Analysis
-          # @menupath: Tools.Export Function List
-          # @description: Exports list of functions with addresses, names, sizes, and signatures to CSV.
 
-          import csv
-          import os
-          import errno
+          # 1. Export functions (CSV)
+          cat > ghidra_scripts/ExportFunctions.py << 'EOF'
+          # @category: Analysis
+          import csv, os, errno
 
           program = getCurrentProgram()
-          function_manager = program.getFunctionManager()
-          functions = function_manager.getFunctions(True)  # true = forward
+          fm = program.getFunctionManager()
+          functions = fm.getFunctions(True)
 
           output_dir = os.environ.get('GITHUB_WORKSPACE', '.') + '/output'
           try:
@@ -50,29 +48,184 @@ jobs:
                   raise
 
           csv_file = os.path.join(output_dir, 'functions.csv')
-
-          count = 0
           with open(csv_file, 'w') as f:
               writer = csv.writer(f)
-              writer.writerow(['Address', 'Name', 'Size', 'Signature'])
+              writer.writerow(['Address', 'Name', 'Size', 'Signature', 'CallingConv', 'StackPurge', 'IsThunk'])
               for func in functions:
                   addr = func.getEntryPoint()
                   name = func.getName()
                   size = func.getBody().getNumAddresses()
                   sig = func.getSignature().getPrototypeString()
-                  writer.writerow([addr, name, size, sig])
-                  count += 1
-
-          print('Exported {} functions to {}'.format(count, csv_file))
+                  cc = func.getCallingConventionName()
+                  purge = func.getStackPurgeSize()
+                  is_thunk = func.isThunk()
+                  writer.writerow([addr, name, size, sig, cc, purge, is_thunk])
+          print('Exported functions')
           EOF
 
-      - name: Run Ghidra headless analysis
+          # 2. Export symbols (imports, exports, labels) as CSV
+          cat > ghidra_scripts/ExportSymbols.py << 'EOF'
+          # @category: Analysis
+          import csv, os, errno
+
+          program = getCurrentProgram()
+          st = program.getSymbolTable()
+          symbols = st.getAllSymbols(True)
+
+          output_dir = os.environ.get('GITHUB_WORKSPACE', '.') + '/output'
+          try:
+              os.makedirs(output_dir)
+          except OSError as e:
+              if e.errno != errno.EEXIST:
+                  raise
+
+          csv_file = os.path.join(output_dir, 'symbols.csv')
+          with open(csv_file, 'w') as f:
+              writer = csv.writer(f)
+              writer.writerow(['Address', 'Name', 'Type', 'Source', 'Namespace'])
+              for sym in symbols:
+                  addr = sym.getAddress()
+                  name = sym.getName()
+                  stype = sym.getSymbolType()
+                  source = sym.getSource()
+                  ns = sym.getParentNamespace().getName()
+                  writer.writerow([addr, name, stype, source, ns])
+          print('Exported symbols')
+          EOF
+
+          # 3. Export all defined strings to a text file
+          cat > ghidra_scripts/ExportStrings.py << 'EOF'
+          # @category: Analysis
+          import os, errno
+
+          program = getCurrentProgram()
+          listing = program.getListing()
+          data_iter = listing.getDefinedData(True)
+
+          output_dir = os.environ.get('GITHUB_WORKSPACE', '.') + '/output'
+          try:
+              os.makedirs(output_dir)
+          except OSError as e:
+              if e.errno != errno.EEXIST:
+                  raise
+
+          out_file = os.path.join(output_dir, 'strings.txt')
+          with open(out_file, 'w') as f:
+              for data in data_iter:
+                  val = data.getValue()
+                  if isinstance(val, str):
+                      f.write('{}: "{}"\n'.format(data.getAddress(), val))
+          print('Exported strings')
+          EOF
+
+          # 4. Export full disassembly listing
+          cat > ghidra_scripts/ExportDisassembly.py << 'EOF'
+          # @category: Analysis
+          import os, errno
+
+          program = getCurrentProgram()
+          listing = program.getListing()
+
+          output_dir = os.environ.get('GITHUB_WORKSPACE', '.') + '/output'
+          try:
+              os.makedirs(output_dir)
+          except OSError as e:
+              if e.errno != errno.EEXIST:
+                  raise
+
+          out_file = os.path.join(output_dir, 'disassembly.txt')
+          with open(out_file, 'w') as f:
+              instructions = listing.getInstructions(True)
+              for instr in instructions:
+                  f.write('{}: {}\n'.format(instr.getAddress(), instr))
+          print('Exported disassembly')
+          EOF
+
+          # 5. Export decompiled C code for every function (as separate files in a folder)
+          cat > ghidra_scripts/ExportDecompiled.py << 'EOF'
+          # @category: Analysis
+          import os, errno
+
+          program = getCurrentProgram()
+          fm = program.getFunctionManager()
+          functions = fm.getFunctions(True)
+
+          output_dir = os.environ.get('GITHUB_WORKSPACE', '.') + '/output/decompiled'
+          try:
+              os.makedirs(output_dir)
+          except OSError as e:
+              if e.errno != errno.EEXIST:
+                  raise
+
+          from ghidra.app.decompiler import DecompInterface
+          from ghidra.util.task import ConsoleTaskMonitor
+
+          decomp = DecompInterface()
+          decomp.openProgram(program)
+          monitor = ConsoleTaskMonitor()
+
+          for func in functions:
+              name = func.getName()
+              addr = func.getEntryPoint()
+              # Sanitize filename
+              safe_name = name.replace('/', '_').replace('\\', '_').replace(':', '_')
+              out_file = os.path.join(output_dir, '{}_{}.c'.format(addr, safe_name))
+              result = decomp.decompileFunction(func, 60, monitor)
+              if result and result.decompileCompleted():
+                  c_code = result.getDecompiledFunction().getC()
+                  with open(out_file, 'w') as f:
+                      f.write('// Function: {} at {}\n\n'.format(name, addr))
+                      f.write(c_code)
+          decomp.dispose()
+          print('Exported decompiled functions')
+          EOF
+
+          # 6. Export cross references (Xrefs) to CSV
+          cat > ghidra_scripts/ExportXrefs.py << 'EOF'
+          # @category: Analysis
+          import csv, os, errno
+
+          program = getCurrentProgram()
+          ref_manager = program.getReferenceManager()
+          references = ref_manager.getReferenceIterator(program.getMinAddress())
+
+          output_dir = os.environ.get('GITHUB_WORKSPACE', '.') + '/output'
+          try:
+              os.makedirs(output_dir)
+          except OSError as e:
+              if e.errno != errno.EEXIST:
+                  raise
+
+          csv_file = os.path.join(output_dir, 'xrefs.csv')
+          with open(csv_file, 'w') as f:
+              writer = csv.writer(f)
+              writer.writerow(['FromAddress', 'ToAddress', 'RefType'])
+              for ref in references:
+                  writer.writerow([ref.getFromAddress(), ref.getToAddress(), ref.getReferenceType()])
+          print('Exported cross references')
+          EOF
+
+      - name: Run Ghidra headless analysis and export scripts
         run: |
           mkdir -p ghidra_project
-          $GHIDRA_INSTALL_DIR/support/analyzeHeadless ghidra_project project1 -import libgame.so -scriptPath ghidra_scripts -postScript ListFunctions.py -deleteProject
+          $GHIDRA_INSTALL_DIR/support/analyzeHeadless ghidra_project project1 \
+            -import libgame.so \
+            -scriptPath ghidra_scripts \
+            -postScript ExportFunctions.py \
+            -postScript ExportSymbols.py \
+            -postScript ExportStrings.py \
+            -postScript ExportDisassembly.py \
+            -postScript ExportDecompiled.py \
+            -postScript ExportXrefs.py \
+            -deleteProject
 
-      - name: Upload function list artifact
+      - name: List generated files
+        run: |
+          echo "Generated files:"
+          find output -type f | sort
+
+      - name: Upload full dump artifact
         uses: actions/upload-artifact@v4
         with:
-          name: libgame-functions
-          path: output/functions.csv
+          name: libgame-full-dump
+          path: output/
