@@ -141,10 +141,10 @@ jobs:
           print('Exported disassembly')
           EOF
 
-          # 5. Export decompiled C code for every function (as separate files in a folder)
+          # 5. Export decompiled C code for every function (with safe filenames)
           cat > ghidra_scripts/ExportDecompiled.py << 'EOF'
           # @category: Analysis
-          import os, errno
+          import os, errno, re
 
           program = getCurrentProgram()
           fm = program.getFunctionManager()
@@ -167,8 +167,13 @@ jobs:
           for func in functions:
               name = func.getName()
               addr = func.getEntryPoint()
-              # Sanitize filename
-              safe_name = name.replace('/', '_').replace('\\', '_').replace(':', '_')
+              # Sanitize filename: replace any invalid character with underscore
+              safe_name = re.sub(r'[<>:"/\\|?*\r\n]', '_', name)
+              # Also remove leading/trailing dots or spaces (Windows restrictions)
+              safe_name = safe_name.strip(' .')
+              # Ensure not empty
+              if not safe_name:
+                  safe_name = 'unnamed'
               out_file = os.path.join(output_dir, '{}_{}.c'.format(addr, safe_name))
               result = decomp.decompileFunction(func, 60, monitor)
               if result and result.decompileCompleted():
@@ -222,7 +227,7 @@ jobs:
       - name: List generated files
         run: |
           echo "Generated files:"
-          find output -type f | sort
+          find output -type f | sort | head -n 20
 
       - name: Upload full dump artifact
         uses: actions/upload-artifact@v4
