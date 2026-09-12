@@ -4,7 +4,7 @@ on:
   workflow_dispatch:
     inputs:
       lib_url:
-        description: 'Optional URL to download libgame.so (e.g. raw file link)'
+        description: 'Optional URL to download libgame.so (raw link)'
         required: false
         type: string
   push:
@@ -16,7 +16,7 @@ on:
 jobs:
   analyze:
     runs-on: ubuntu-latest
-    timeout-minutes: 90
+    timeout-minutes: 120
     permissions:
       contents: read
 
@@ -34,16 +34,30 @@ jobs:
       - name: Install system tools
         run: |
           sudo apt-get update -qq
-          sudo apt-get install -y -qq binutils file unzip wget
+          sudo apt-get install -y -qq binutils file unzip wget git
 
       - name: Cache Ghidra
         id: cache-ghidra
         uses: actions/cache@v4
         with:
           path: ghidra
-          key: ghidra-11.1.2
+          key: ghidra-11.1.2-${{ runner.os }}
 
-      # ---------- Locate / Download target ----------
+      - name: Download Ghidra
+        if: steps.cache-ghidra.outputs.cache-hit != 'true'
+        run: |
+          set -e
+          GHIDRA_VERSION=11.1.2
+          GHIDRA_DATE=20240709
+          wget -q "https://github.com/NationalSecurityAgency/ghidra/releases/download/Ghidra_${GHIDRA_VERSION}_build/ghidra_${GHIDRA_VERSION}_PUBLIC_${GHIDRA_DATE}.zip" -O ghidra.zip
+          unzip -q ghidra.zip
+          mv "ghidra_${GHIDRA_VERSION}_PUBLIC" ghidra
+          rm -f ghidra.zip
+
+      - name: Export GHIDRA_HOME
+        run: echo "GHIDRA_HOME=$PWD/ghidra" >> $GITHUB_ENV
+
+      # ---------- Locate target ----------
       - name: Obtain libgame.so
         run: |
           set -e
@@ -62,6 +76,7 @@ jobs:
       # ---------- Pre-analysis: ELF + strings ----------
       - name: Basic ELF extraction
         run: |
+          set -e
           mkdir -p output
           file "$LIB"                              > output/01_file.txt          || true
           readelf -h "$LIB"                        > output/02_elf_header.txt   || true
@@ -76,6 +91,7 @@ jobs:
 
       - name: Extract strings & JNI
         run: |
+          set -e
           strings -a -t x "$LIB" > output/20_strings_all.txt || true
           strings -a -t x "$LIB" | grep -iE 'Java_[a-zA-Z_]+' > output/21_jni_exports.txt || true
           strings -a "$LIB" | grep '^Java_' | sort -u > output/22_jni_methods.txt || true
@@ -84,34 +100,20 @@ jobs:
           strings -a "$LIB" | grep -i cocos | sort -u > output/24_cocos_strings.txt || true
           strings -a "$LIB" | grep -iE 'xxtea|tea|decrypt|encrypt' | sort -u > output/25_crypto_strings.txt || true
 
-      # ---------- Download Ghidra if not cached ----------
-      - name: Download Ghidra
-        if: steps.cache-ghidra.outputs.cache-hit != 'true'
-        run: |
-          set -e
-          GHIDRA_VERSION=11.1.2
-          GHIDRA_DATE=20240709
-          wget -q "https://github.com/NationalSecurityAgency/ghidra/releases/download/Ghidra_${GHIDRA_VERSION}_build/ghidra_${GHIDRA_VERSION}_PUBLIC_${GHIDRA_DATE}.zip" -O ghidra.zip
-          unzip -q ghidra.zip
-          mv "ghidra_${GHIDRA_VERSION}_PUBLIC" ghidra
-          rm -f ghidra.zip
-      
-      - name: Export GHIDRA_HOME
-        run: echo "GHIDRA_HOME=$PWD/ghidra" >> $GITHUB_ENV
-
-      # ---------- (Optional) FIDB from ATR ----------
+      # ---------- Optional FIDB ----------
       - name: Fetch ATR FIDBs (optional)
         continue-on-error: true
         run: |
+          set -e
           mkdir -p ghidra_fidbs
-          # shallow sparse clone of the ATR FIDB collection
           git clone --depth 1 https://github.com/advanced-threat-research/FIDBs.git /tmp/fidbs 2>/dev/null || true
           find /tmp/fidbs -name '*.fidb' -exec cp {} ghidra_fidbs/ \; 2>/dev/null || true
           ls -la ghidra_fidbs || true
 
-      # ---------- Write Ghidra scripts ----------
+      # ---------- Write custom scripts ----------
       - name: Write Ghidra scripts
         run: |
+          set -e
           mkdir -p ghidra_scripts
 
           # ---- DumpInfo.py ----
@@ -276,7 +278,6 @@ jobs:
                       size = 0
                   f.write("%s\t%s\t%d\n" % (func.getEntryPoint(), func.getName(), size))
 
-          # also dump interesting-named ones into a separate file
           keys = ['fuel','player','save','load','coin','money','score',
                   'garage','vehicle','upgrade','stage','iap','purchase',
                   'reward','boost','tune','part']
@@ -343,35 +344,42 @@ jobs:
           OUT_DIR: ${{ github.workspace }}/output
         run: |
           set -e
+
+          # *** FIX: پروژه باید والدش وجود داشته باشه ***
+          mkdir -p "$GITHUB_WORKSPACE/ghidra_proj"
           mkdir -p "$OUT_DIR"
 
-          # Build optional FIDB import flags
-          FID_FLAGS=""
-          if [ -d "$GITHUB_WORKSPACE/ghidra_fidbs" ]; then
+          # Build a list of -preScript flags for FIDBs (اگه وجود داشتن)
+          FID_ARGS=""
+          if [ -d "$GITHUB_WORKSPACE/ghidra_fidbs" ] && ls "$GITHUB_WORKSPACE/ghidra_fidbs"/*.fidb >/dev/null 2>&1; then
             for fidb in "$GITHUB_WORKSPACE/ghidra_fidbs"/*.fidb; do
-              [ -f "$fidb" ] || continue
-              FID_FLAGS="$FID_FLAGS -preScript FunctionIDScript.py"
+              FID_ARGS="$FID_ARGS -preScript FunctionIDScript.py"
             done
           fi
 
-          $GHIDRA_HOME/support/analyzeHeadless "$GITHUB_WORKSPACE/ghidra_proj" HCRProj \
+          echo "[*] FID args: $FID_ARGS"
+          echo "[*] Ghidra home: $GHIDRA_HOME"
+
+          # اجرای headless
+          $GHIDRA_HOME/support/analyzeHeadless \
+            "$GITHUB_WORKSPACE/ghidra_proj" \
+            HCRProj \
             -import "$LIB" \
             -scriptPath "$GITHUB_WORKSPACE/ghidra_scripts" \
+            $FID_ARGS \
             -postScript DumpInfo.py \
             -postScript RenameFunctionsWithStrings.py \
             -postScript ExportFunctions.py \
             -postScript ExportDecompiled.py \
-            -analysisTimeoutPerFile 3600 \
-            -deleteProject
+            -analysisTimeoutPerFile 7200
 
       # ---------- Post-processing ----------
       - name: Post-process output
         run: |
-          # Sort / dedupe
+          set -e
           [ -f output/40_functions.txt ] && sort -u output/40_functions.txt -o output/40_functions.txt || true
           [ -f output/41_functions_interesting.txt ] && sort -u output/41_functions_interesting.txt -o output/41_functions_interesting.txt || true
 
-          # Summary
           {
             echo "=== libgame.so Analysis Summary ==="
             echo
@@ -394,8 +402,12 @@ jobs:
             ls output/decompiled 2>/dev/null | wc -l || echo "n/a"
           } | tee output/00_SUMMARY.txt
 
-          # Tarball everything
           tar -czf libgame-analysis.tar.gz output/
+
+      # ---------- Cleanup ----------
+      - name: Cleanup project dir
+        if: always()
+        run: rm -rf "$GITHUB_WORKSPACE/ghidra_proj" || true
 
       # ---------- Upload artifacts ----------
       - name: Upload full analysis
