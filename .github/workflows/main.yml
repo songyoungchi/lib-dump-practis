@@ -1,236 +1,409 @@
-name: Full Dump of libgame.so
+name: Ghidra libgame.so Analyzer
 
 on:
   workflow_dispatch:
+    inputs:
+      lib_url:
+        description: 'Optional URL to download libgame.so (e.g. raw file link)'
+        required: false
+        type: string
   push:
     paths:
       - 'libgame.so'
-      - '.github/workflows/full_dump.yml'
+      - 'libs/**'
+      - '.github/workflows/**'
 
 jobs:
-  ghidra-full-dump:
+  analyze:
     runs-on: ubuntu-latest
+    timeout-minutes: 90
+    permissions:
+      contents: read
+
     steps:
+      # ---------- Setup ----------
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Set up JDK 17
-        uses: actions/setup-java@v5
+      - name: Setup Java 17
+        uses: actions/setup-java@v4
         with:
-          distribution: 'temurin'
+          distribution: temurin
           java-version: '17'
 
-      - name: Download Ghidra
+      - name: Install system tools
         run: |
-          wget -q https://github.com/NationalSecurityAgency/ghidra/releases/download/Ghidra_11.0.1_build/ghidra_11.0.1_PUBLIC_20240130.zip
-          unzip -q ghidra_11.0.1_PUBLIC_20240130.zip
-          echo "GHIDRA_INSTALL_DIR=$PWD/ghidra_11.0.1_PUBLIC" >> $GITHUB_ENV
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq binutils file unzip wget
 
-      - name: Create output directories and Ghidra scripts
+      - name: Cache Ghidra
+        id: cache-ghidra
+        uses: actions/cache@v4
+        with:
+          path: ghidra
+          key: ghidra-11.1.2
+
+      # ---------- Locate / Download target ----------
+      - name: Obtain libgame.so
+        run: |
+          set -e
+          if [ -n "${{ inputs.lib_url }}" ]; then
+            echo "[*] Downloading from URL..."
+            wget -q "${{ inputs.lib_url }}" -O libgame.so
+          fi
+          LIB=$(find . -name 'libgame.so' -type f | head -n1)
+          if [ -z "$LIB" ]; then
+            echo "::error::libgame.so was not found in repository nor downloaded."; exit 1
+          fi
+          echo "LIB=$PWD/$LIB" >> $GITHUB_ENV
+          echo "[+] Found target: $LIB"
+          file "$LIB"
+
+      # ---------- Pre-analysis: ELF + strings ----------
+      - name: Basic ELF extraction
         run: |
           mkdir -p output
+          file "$LIB"                              > output/01_file.txt          || true
+          readelf -h "$LIB"                        > output/02_elf_header.txt   || true
+          readelf -S "$LIB"                        > output/03_sections.txt     || true
+          readelf -d "$LIB"                        > output/04_dynamic.txt      || true
+          readelf -lW "$LIB"                       > output/05_segments.txt     || true
+          readelf -sW "$LIB"                       > output/06_symbols.txt      || true
+          readelf -rW "$LIB"                       > output/07_relocations.txt  || true
+          nm -D "$LIB"                             > output/08_nm_dynamic.txt   || true
+          nm -C "$LIB"                             > output/09_nm_demangled.txt || true
+          objdump -T "$LIB"                        > output/10_objdump_T.txt    || true
+
+      - name: Extract strings & JNI
+        run: |
+          strings -a -t x "$LIB" > output/20_strings_all.txt || true
+          strings -a -t x "$LIB" | grep -iE 'Java_[a-zA-Z_]+' > output/21_jni_exports.txt || true
+          strings -a "$LIB" | grep '^Java_' | sort -u > output/22_jni_methods.txt || true
+          strings -a "$LIB" | grep -iE 'fuel|player|save|load|coin|money|score|garage|vehicle|upgrade|stage|iap|purchase' \
+              | sort -u > output/23_interesting_strings.txt || true
+          strings -a "$LIB" | grep -i cocos | sort -u > output/24_cocos_strings.txt || true
+          strings -a "$LIB" | grep -iE 'xxtea|tea|decrypt|encrypt' | sort -u > output/25_crypto_strings.txt || true
+
+      # ---------- Download Ghidra if not cached ----------
+      - name: Download Ghidra
+        if: steps.cache-ghidra.outputs.cache-hit != 'true'
+        run: |
+          set -e
+          GHIDRA_VERSION=11.1.2
+          GHIDRA_DATE=20240709
+          wget -q "https://github.com/NationalSecurityAgency/ghidra/releases/download/Ghidra_${GHIDRA_VERSION}_build/ghidra_${GHIDRA_VERSION}_PUBLIC_${GHIDRA_DATE}.zip" -O ghidra.zip
+          unzip -q ghidra.zip
+          mv "ghidra_${GHIDRA_VERSION}_PUBLIC" ghidra
+          rm -f ghidra.zip
+      
+      - name: Export GHIDRA_HOME
+        run: echo "GHIDRA_HOME=$PWD/ghidra" >> $GITHUB_ENV
+
+      # ---------- (Optional) FIDB from ATR ----------
+      - name: Fetch ATR FIDBs (optional)
+        continue-on-error: true
+        run: |
+          mkdir -p ghidra_fidbs
+          # shallow sparse clone of the ATR FIDB collection
+          git clone --depth 1 https://github.com/advanced-threat-research/FIDBs.git /tmp/fidbs 2>/dev/null || true
+          find /tmp/fidbs -name '*.fidb' -exec cp {} ghidra_fidbs/ \; 2>/dev/null || true
+          ls -la ghidra_fidbs || true
+
+      # ---------- Write Ghidra scripts ----------
+      - name: Write Ghidra scripts
+        run: |
           mkdir -p ghidra_scripts
 
-          # 1. Export functions (CSV)
-          cat > ghidra_scripts/ExportFunctions.py << 'EOF'
-          # @category: Analysis
-          import csv, os, errno
+          # ---- DumpInfo.py ----
+          cat > ghidra_scripts/DumpInfo.py <<'PYEOF'
+          #@category HCR
+          #@runtime Jython
+          import os
 
-          program = getCurrentProgram()
-          fm = program.getFunctionManager()
-          functions = fm.getFunctions(True)
+          def out_path(name):
+              d = os.environ.get('OUT_DIR', 'output')
+              if not os.path.exists(d):
+                  os.makedirs(d)
+              return os.path.join(d, name)
 
-          output_dir = os.environ.get('GITHUB_WORKSPACE', '.') + '/output'
-          try:
-              os.makedirs(output_dir)
-          except OSError as e:
-              if e.errno != errno.EEXIST:
-                  raise
+          with open(out_path('30_memory_blocks.txt'), 'w') as f:
+              for b in currentProgram.getMemory().getBlocks():
+                  f.write("%s\t%s\t%s\t%d\n" % (b.getName(), b.getStart(), b.getEnd(), b.getSize()))
 
-          csv_file = os.path.join(output_dir, 'functions.csv')
-          with open(csv_file, 'w') as f:
-              writer = csv.writer(f)
-              writer.writerow(['Address', 'Name', 'Size', 'Signature', 'CallingConv', 'StackPurge', 'IsThunk'])
-              for func in functions:
-                  addr = func.getEntryPoint()
-                  name = func.getName()
-                  size = func.getBody().getNumAddresses()
-                  sig = func.getSignature().getPrototypeString()
-                  cc = func.getCallingConventionName()
-                  purge = func.getStackPurgeSize()
-                  is_thunk = func.isThunk()
-                  writer.writerow([addr, name, size, sig, cc, purge, is_thunk])
-          print('Exported functions')
-          EOF
+          with open(out_path('31_imports.txt'), 'w') as f:
+              for sym in currentProgram.getSymbolTable().getExternalSymbols():
+                  f.write("%s\n" % sym.getName())
 
-          # 2. Export symbols (imports, exports, labels) as CSV
-          cat > ghidra_scripts/ExportSymbols.py << 'EOF'
-          # @category: Analysis
-          import csv, os, errno
+          with open(out_path('32_defined_strings.txt'), 'w') as f:
+              for data in currentProgram.getListing().getDefinedData(True):
+                  try:
+                      val = data.getValue()
+                  except:
+                      val = None
+                  if val is not None and isinstance(val, str) and len(val) >= 4:
+                      f.write("%s\t%s\n" % (data.getAddress(), val.replace('\n', '\\n')))
 
-          program = getCurrentProgram()
-          st = program.getSymbolTable()
-          symbols = st.getAllSymbols(True)
+          print("[DumpInfo] done")
+          PYEOF
 
-          output_dir = os.environ.get('GITHUB_WORKSPACE', '.') + '/output'
-          try:
-              os.makedirs(output_dir)
-          except OSError as e:
-              if e.errno != errno.EEXIST:
-                  raise
+          # ---- RenameFunctionsWithStrings.py ----
+          cat > ghidra_scripts/RenameFunctionsWithStrings.py <<'PYEOF'
+          #@category HCR
+          #@runtime Jython
+          import re
+          from ghidra.program.model.symbol import SourceType
 
-          csv_file = os.path.join(output_dir, 'symbols.csv')
-          with open(csv_file, 'w') as f:
-              writer = csv.writer(f)
-              writer.writerow(['Address', 'Name', 'Type', 'Source', 'Namespace'])
-              for sym in symbols:
-                  addr = sym.getAddress()
-                  name = sym.getName()
-                  stype = sym.getSymbolType()
-                  source = sym.getSource()
-                  ns = sym.getParentNamespace().getName()
-                  writer.writerow([addr, name, stype, source, ns])
-          print('Exported symbols')
-          EOF
+          def sanitize(s):
+              s = re.sub(r'[^A-Za-z0-9_]', '_', s)
+              s = re.sub(r'_+', '_', s).strip('_')
+              if len(s) > 50:
+                  s = s[:50]
+              if not s or s[0].isdigit():
+                  s = 's_' + s
+              return s
 
-          # 3. Export all defined strings to a text file
-          cat > ghidra_scripts/ExportStrings.py << 'EOF'
-          # @category: Analysis
-          import os, errno
+          def is_default_name(n):
+              return (n.startswith('FUN_') or n.startswith('func_') or
+                      n.startswith('thunk_') or n.startswith('LAB_') or
+                      n.startswith('sub_')  or n.startswith('FID_'))
 
-          program = getCurrentProgram()
-          listing = program.getListing()
-          data_iter = listing.getDefinedData(True)
+          fm = currentProgram.getFunctionManager()
+          listing = currentProgram.getListing()
+          st = currentProgram.getSymbolTable()
 
-          output_dir = os.environ.get('GITHUB_WORKSPACE', '.') + '/output'
-          try:
-              os.makedirs(output_dir)
-          except OSError as e:
-              if e.errno != errno.EEXIST:
-                  raise
+          funcs = list(fm.getFunctions(True))
+          total = len(funcs)
+          print("[Rename] total functions: %d" % total)
 
-          out_file = os.path.join(output_dir, 'strings.txt')
-          with open(out_file, 'w') as f:
-              for data in data_iter:
-                  val = data.getValue()
-                  if isinstance(val, str):
-                      f.write('{}: "{}"\n'.format(data.getAddress(), val))
-          print('Exported strings')
-          EOF
+          renamed = 0
+          processed = 0
+          used = set()
 
-          # 4. Export full disassembly listing
-          cat > ghidra_scripts/ExportDisassembly.py << 'EOF'
-          # @category: Analysis
-          import os, errno
+          for func in funcs:
+              processed += 1
+              if processed % 1000 == 0:
+                  print("[Rename] %d/%d | renamed so far: %d" % (processed, total, renamed))
 
-          program = getCurrentProgram()
-          listing = program.getListing()
+              name = func.getName()
+              if not is_default_name(name):
+                  continue
 
-          output_dir = os.environ.get('GITHUB_WORKSPACE', '.') + '/output'
-          try:
-              os.makedirs(output_dir)
-          except OSError as e:
-              if e.errno != errno.EEXIST:
-                  raise
+              body = func.getBody()
+              if body is None:
+                  continue
 
-          out_file = os.path.join(output_dir, 'disassembly.txt')
-          with open(out_file, 'w') as f:
-              instructions = listing.getInstructions(True)
-              for instr in instructions:
-                  f.write('{}: {}\n'.format(instr.getAddress(), instr))
-          print('Exported disassembly')
-          EOF
+              strings_found = []
+              try:
+                  instrs = listing.getInstructions(body, True)
+                  count = 0
+                  for instr in instrs:
+                      count += 1
+                      if count > 30000:
+                          break
+                      try:
+                          refs = instr.getReferencesFrom()
+                      except:
+                          continue
+                      for ref in refs:
+                          try:
+                              to_addr = ref.getToAddress()
+                          except:
+                              continue
+                          data = getDataAt(to_addr)
+                          if data is None:
+                              continue
+                          try:
+                              val = data.getValue()
+                          except:
+                              val = None
+                          if val is None or not isinstance(val, str):
+                              continue
+                          if len(val) < 4 or len(val) > 80:
+                              continue
+                          if not val.strip():
+                              continue
+                          strings_found.append(val)
+              except:
+                  continue
 
-          # 5. Export decompiled C code for every function (with safe filenames)
-          cat > ghidra_scripts/ExportDecompiled.py << 'EOF'
-          # @category: Analysis
-          import os, errno, re
+              if not strings_found:
+                  continue
 
-          program = getCurrentProgram()
-          fm = program.getFunctionManager()
-          functions = fm.getFunctions(True)
+              strings_found.sort(key=lambda s: (0 if any(c.isalpha() for c in s) else 1, len(s)))
+              base = sanitize(strings_found[0])
+              if len(base) < 3:
+                  continue
 
-          output_dir = os.environ.get('GITHUB_WORKSPACE', '.') + '/output/decompiled'
-          try:
-              os.makedirs(output_dir)
-          except OSError as e:
-              if e.errno != errno.EEXIST:
-                  raise
+              new_name = 'str_' + base
+              candidate = new_name
+              suffix = 0
+              while candidate in used or st.getSymbol(candidate) is not None:
+                  suffix += 1
+                  if suffix > 500:
+                      break
+                  candidate = "%s_%d" % (new_name, suffix)
+              if suffix > 500:
+                  continue
 
+              try:
+                  func.setName(candidate, SourceType.USER_DEFINED)
+                  used.add(candidate)
+                  renamed += 1
+              except:
+                  pass
+
+          print("[Rename] DONE. renamed=%d" % renamed)
+          PYEOF
+
+          # ---- ExportFunctions.py ----
+          cat > ghidra_scripts/ExportFunctions.py <<'PYEOF'
+          #@category HCR
+          #@runtime Jython
+          import os
+
+          def out_path(name):
+              d = os.environ.get('OUT_DIR', 'output')
+              if not os.path.exists(d):
+                  os.makedirs(d)
+              return os.path.join(d, name)
+
+          fm = currentProgram.getFunctionManager()
+          with open(out_path('40_functions.txt'), 'w') as f:
+              for func in fm.getFunctions(True):
+                  try:
+                      size = func.getBody().getNumAddresses()
+                  except:
+                      size = 0
+                  f.write("%s\t%s\t%d\n" % (func.getEntryPoint(), func.getName(), size))
+
+          # also dump interesting-named ones into a separate file
+          keys = ['fuel','player','save','load','coin','money','score',
+                  'garage','vehicle','upgrade','stage','iap','purchase',
+                  'reward','boost','tune','part']
+          with open(out_path('41_functions_interesting.txt'), 'w') as f:
+              for func in fm.getFunctions(True):
+                  n = func.getName().lower()
+                  if any(k in n for k in keys):
+                      f.write("%s\t%s\n" % (func.getEntryPoint(), func.getName()))
+
+          print("[ExportFunctions] done")
+          PYEOF
+
+          # ---- ExportDecompiled.py ----
+          cat > ghidra_scripts/ExportDecompiled.py <<'PYEOF'
+          #@category HCR
+          #@runtime Jython
+          import os
           from ghidra.app.decompiler import DecompInterface
-          from ghidra.util.task import ConsoleTaskMonitor
+
+          base = os.environ.get('OUT_DIR', 'output')
+          out_dir = os.path.join(base, 'decompiled')
+          if not os.path.exists(out_dir):
+              os.makedirs(out_dir)
+
+          KEYS = ['fuel','player','save','load','coin','money','score',
+                  'garage','vehicle','upgrade','stage','iap','purchase',
+                  'reward','boost','tune','part']
+
+          fm = currentProgram.getFunctionManager()
+          targets = []
+          for func in fm.getFunctions(True):
+              n = func.getName().lower()
+              if any(k in n for k in KEYS):
+                  targets.append(func)
+
+          print("[Decompile] interesting functions: %d" % len(targets))
 
           decomp = DecompInterface()
-          decomp.openProgram(program)
-          monitor = ConsoleTaskMonitor()
+          decomp.openProgram(currentProgram)
 
-          for func in functions:
-              name = func.getName()
-              addr = func.getEntryPoint()
-              # Sanitize filename: replace any invalid character with underscore
-              safe_name = re.sub(r'[<>:"/\\|?*\r\n]', '_', name)
-              # Also remove leading/trailing dots or spaces (Windows restrictions)
-              safe_name = safe_name.strip(' .')
-              # Ensure not empty
-              if not safe_name:
-                  safe_name = 'unnamed'
-              out_file = os.path.join(output_dir, '{}_{}.c'.format(addr, safe_name))
-              result = decomp.decompileFunction(func, 60, monitor)
-              if result and result.decompileCompleted():
-                  c_code = result.getDecompiledFunction().getC()
-                  with open(out_file, 'w') as f:
-                      f.write('// Function: {} at {}\n\n'.format(name, addr))
-                      f.write(c_code)
-          decomp.dispose()
-          print('Exported decompiled functions')
-          EOF
+          count = 0
+          for func in targets:
+              try:
+                  res = decomp.decompileFunction(func, 60, monitor)
+                  if res and res.decompileCompleted():
+                      code = res.getDecompiledFunction().getC()
+                      safe = func.getName().replace('/','_').replace('<','_').replace('>','_').replace(' ','_')
+                      path = os.path.join(out_dir, "%s_%s.c" % (func.getEntryPoint(), safe))
+                      with open(path, 'w') as f:
+                          f.write("// %s @ %s\n\n" % (func.getName(), func.getEntryPoint()))
+                          f.write(code)
+                      count += 1
+              except:
+                  pass
 
-          # 6. Export cross references (Xrefs) to CSV
-          cat > ghidra_scripts/ExportXrefs.py << 'EOF'
-          # @category: Analysis
-          import csv, os, errno
+          print("[Decompile] wrote %d files" % count)
+          PYEOF
 
-          program = getCurrentProgram()
-          ref_manager = program.getReferenceManager()
-          references = ref_manager.getReferenceIterator(program.getMinAddress())
+          ls -la ghidra_scripts
 
-          output_dir = os.environ.get('GITHUB_WORKSPACE', '.') + '/output'
-          try:
-              os.makedirs(output_dir)
-          except OSError as e:
-              if e.errno != errno.EEXIST:
-                  raise
-
-          csv_file = os.path.join(output_dir, 'xrefs.csv')
-          with open(csv_file, 'w') as f:
-              writer = csv.writer(f)
-              writer.writerow(['FromAddress', 'ToAddress', 'RefType'])
-              for ref in references:
-                  writer.writerow([ref.getFromAddress(), ref.getToAddress(), ref.getReferenceType()])
-          print('Exported cross references')
-          EOF
-
-      - name: Run Ghidra headless analysis and export scripts
+      # ---------- Run Ghidra Headless ----------
+      - name: Run Ghidra headless analysis + scripts
+        env:
+          OUT_DIR: ${{ github.workspace }}/output
         run: |
-          mkdir -p ghidra_project
-          $GHIDRA_INSTALL_DIR/support/analyzeHeadless ghidra_project project1 \
-            -import libgame.so \
-            -scriptPath ghidra_scripts \
+          set -e
+          mkdir -p "$OUT_DIR"
+
+          # Build optional FIDB import flags
+          FID_FLAGS=""
+          if [ -d "$GITHUB_WORKSPACE/ghidra_fidbs" ]; then
+            for fidb in "$GITHUB_WORKSPACE/ghidra_fidbs"/*.fidb; do
+              [ -f "$fidb" ] || continue
+              FID_FLAGS="$FID_FLAGS -preScript FunctionIDScript.py"
+            done
+          fi
+
+          $GHIDRA_HOME/support/analyzeHeadless "$GITHUB_WORKSPACE/ghidra_proj" HCRProj \
+            -import "$LIB" \
+            -scriptPath "$GITHUB_WORKSPACE/ghidra_scripts" \
+            -postScript DumpInfo.py \
+            -postScript RenameFunctionsWithStrings.py \
             -postScript ExportFunctions.py \
-            -postScript ExportSymbols.py \
-            -postScript ExportStrings.py \
-            -postScript ExportDisassembly.py \
             -postScript ExportDecompiled.py \
-            -postScript ExportXrefs.py \
+            -analysisTimeoutPerFile 3600 \
             -deleteProject
 
-      - name: List generated files
+      # ---------- Post-processing ----------
+      - name: Post-process output
         run: |
-          echo "Generated files:"
-          find output -type f | sort | head -n 20
+          # Sort / dedupe
+          [ -f output/40_functions.txt ] && sort -u output/40_functions.txt -o output/40_functions.txt || true
+          [ -f output/41_functions_interesting.txt ] && sort -u output/41_functions_interesting.txt -o output/41_functions_interesting.txt || true
 
-      - name: Upload full dump artifact
+          # Summary
+          {
+            echo "=== libgame.so Analysis Summary ==="
+            echo
+            echo "--- File ---"
+            cat output/01_file.txt || true
+            echo
+            echo "--- Functions total ---"
+            wc -l output/40_functions.txt 2>/dev/null || echo "n/a"
+            echo
+            echo "--- Interesting functions ---"
+            wc -l output/41_functions_interesting.txt 2>/dev/null || echo "n/a"
+            echo
+            echo "--- JNI methods (Java_*) ---"
+            wc -l output/22_jni_methods.txt 2>/dev/null || echo "n/a"
+            echo
+            echo "--- Interesting strings ---"
+            wc -l output/23_interesting_strings.txt 2>/dev/null || echo "n/a"
+            echo
+            echo "--- Decompiled files ---"
+            ls output/decompiled 2>/dev/null | wc -l || echo "n/a"
+          } | tee output/00_SUMMARY.txt
+
+          # Tarball everything
+          tar -czf libgame-analysis.tar.gz output/
+
+      # ---------- Upload artifacts ----------
+      - name: Upload full analysis
         uses: actions/upload-artifact@v4
         with:
-          name: libgame-full-dump
-          path: output/
+          name: libgame-analysis
+          path: |
+            output/
+            libgame-analysis.tar.gz
+          retention-days: 30
+          if-no-files-found: error
