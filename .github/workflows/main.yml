@@ -100,16 +100,6 @@ jobs:
           strings -a "$LIB" | grep -i cocos | sort -u > output/24_cocos_strings.txt || true
           strings -a "$LIB" | grep -iE 'xxtea|tea|decrypt|encrypt' | sort -u > output/25_crypto_strings.txt || true
 
-      # ---------- Optional FIDB ----------
-      - name: Fetch ATR FIDBs (optional)
-        continue-on-error: true
-        run: |
-          set -e
-          mkdir -p ghidra_fidbs
-          git clone --depth 1 https://github.com/advanced-threat-research/FIDBs.git /tmp/fidbs 2>/dev/null || true
-          find /tmp/fidbs -name '*.fidb' -exec cp {} ghidra_fidbs/ \; 2>/dev/null || true
-          ls -la ghidra_fidbs || true
-
       # ---------- Write custom scripts ----------
       - name: Write Ghidra scripts
         run: |
@@ -345,28 +335,20 @@ jobs:
         run: |
           set -e
 
-          # *** FIX: پروژه باید والدش وجود داشته باشه ***
+          # پروژه باید والدش وجود داشته باشه
           mkdir -p "$GITHUB_WORKSPACE/ghidra_proj"
           mkdir -p "$OUT_DIR"
 
-          # Build a list of -preScript flags for FIDBs (اگه وجود داشتن)
-          FID_ARGS=""
-          if [ -d "$GITHUB_WORKSPACE/ghidra_fidbs" ] && ls "$GITHUB_WORKSPACE/ghidra_fidbs"/*.fidb >/dev/null 2>&1; then
-            for fidb in "$GITHUB_WORKSPACE/ghidra_fidbs"/*.fidb; do
-              FID_ARGS="$FID_ARGS -preScript FunctionIDScript.py"
-            done
-          fi
-
-          echo "[*] FID args: $FID_ARGS"
           echo "[*] Ghidra home: $GHIDRA_HOME"
+          echo "[*] LIB: $LIB"
+          echo "[*] Script path: $GITHUB_WORKSPACE/ghidra_scripts"
+          ls -la "$GITHUB_WORKSPACE/ghidra_scripts"
 
-          # اجرای headless
-          $GHIDRA_HOME/support/analyzeHeadless \
+          "$GHIDRA_HOME/support/analyzeHeadless" \
             "$GITHUB_WORKSPACE/ghidra_proj" \
             HCRProj \
             -import "$LIB" \
             -scriptPath "$GITHUB_WORKSPACE/ghidra_scripts" \
-            $FID_ARGS \
             -postScript DumpInfo.py \
             -postScript RenameFunctionsWithStrings.py \
             -postScript ExportFunctions.py \
